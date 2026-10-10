@@ -1,6 +1,7 @@
 package com.signde.androidvideooverlay
 
 import android.accessibilityservice.AccessibilityService
+import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.BroadcastReceiver
@@ -12,6 +13,7 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.net.ConnectivityManager
 import android.os.Handler
 import android.os.IBinder
@@ -19,6 +21,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
+import android.view.Display
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -136,7 +139,19 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     private val textHideAppNameKey = "pref_hide_app_name_key"
     private val textHideAppMemoryUsageKey = "pref_hide_app_memory_usage_key"
 
+    private var currentForegroundPackage: String? = null
+
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val pkg = event.packageName?.toString()
+            if (!pkg.isNullOrEmpty() &&
+                pkg != packageName &&
+                !pkg.contains("systemui", ignoreCase = true) &&
+                !pkg.contains("launcher", ignoreCase = true)
+            ) {
+                currentForegroundPackage = pkg
+            }
+        }
     }
 
     override fun onInterrupt() {
@@ -145,34 +160,49 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     private fun ensureService(): IBinder? {
         synchronized(lock) {
             if (serviceConnection == null) {
-                serviceConnection = object : ServiceConnection {
-                    override fun onNullBinding(componentName: ComponentName) {
-                        synchronized(lock) {
-                            Log.d("TAG", "NES service is not supported")
-                        }
+                try {
+                    val isNesInstalled = try {
+                        packageManager.getPackageInfo("com.nes.tvbugtracker", 0) != null
+                    } catch (e: Exception) {
+                        false
                     }
 
-                    override fun onServiceConnected(componentName: ComponentName, iBinder: IBinder) {
-                        synchronized(lock) {
-                            Log.d("TAG", "NES service connected")
-                            serviceBinder = iBinder
+                    if (isNesInstalled) {
+                        serviceConnection = object : ServiceConnection {
+                            override fun onNullBinding(componentName: ComponentName) {
+                                synchronized(lock) {
+                                    Log.d("TAG", "NES service is not supported")
+                                }
+                            }
 
-                            startTvBugTracker()
-                            updateOverlayKeyButton()
+                            override fun onServiceConnected(componentName: ComponentName, iBinder: IBinder) {
+                                synchronized(lock) {
+                                    Log.d("TAG", "NES service connected")
+                                    serviceBinder = iBinder
+
+                                    startTvBugTracker()
+                                    updateOverlayKeyButton()
+                                }
+                            }
+
+                            override fun onServiceDisconnected(componentName: ComponentName) {
+                                synchronized(lock) {
+                                    Log.d("TAG", "NES service disconnected")
+                                    serviceBinder = null
+                                }
+                            }
                         }
-                    }
 
-                    override fun onServiceDisconnected(componentName: ComponentName) {
-                        synchronized(lock) {
-                            Log.d("TAG", "NES service disconnected")
-                            serviceBinder = null
+                        val intent = Intent().setClassName("com.nes.tvbugtracker", "com.nes.tvbugtracker.MainService")
+                        if (!this.bindService(intent, serviceConnection!!, Context.BIND_AUTO_CREATE)) {
+                            Log.d("TAG", "NES service not available")
                         }
+                    } else {
+                        Log.d("TAG", "Non-SEI device: NES service not present")
                     }
-                }
-
-                val intent = Intent().setClassName("com.nes.tvbugtracker", "com.nes.tvbugtracker.MainService")
-                if (!this.bindService(intent, serviceConnection!!, 1)) {
-                    Log.d("TAG", "NES service not available")
+                } catch (e: Throwable) {
+                    Log.d("TAG", "Error checking/binding NES service: ${e.message}")
+                    serviceConnection = null
                 }
             }
 
@@ -256,11 +286,14 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     }
 
     private fun startTvBugTracker() {
-        val intent = Intent("com.nes.action.SHOW_DEBUG_VIEW")
-
-        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        intent.putExtra("invisible", 1)
-        startActivity(intent)
+        try {
+            val intent = Intent("com.nes.action.SHOW_DEBUG_VIEW")
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            intent.putExtra("invisible", 1)
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.d("TAG", "NES tvbugtracker activity not available: ${e.message}")
+        }
     }
 
     override fun onServiceConnected() {
@@ -268,22 +301,25 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         activeService = this
         Log.d("TAG", "onServiceConnected")
 
-        // The NES companion service is optional on non-SEI Android TV devices.
-        updateOverlayKeyButton()
-        val isDebuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
-        if (isDebuggable && debugToggleReceiver == null) {
-            debugToggleReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    if (overlayView == null) createOverlay() else removeOverlay()
+        try {
+            updateOverlayKeyButton()
+            val isDebuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+            if (isDebuggable && debugToggleReceiver == null) {
+                debugToggleReceiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        if (overlayView == null) createOverlay() else removeOverlay()
+                    }
                 }
+                registerReceiver(
+                    debugToggleReceiver,
+                    IntentFilter("com.signde.androidvideooverlay.DEBUG_TOGGLE"),
+                    Context.RECEIVER_EXPORTED
+                )
             }
-            registerReceiver(
-                debugToggleReceiver,
-                IntentFilter("com.signde.androidvideooverlay.DEBUG_TOGGLE"),
-                Context.RECEIVER_EXPORTED
-            )
+            ensureService()
+        } catch (e: Throwable) {
+            Log.e("MainActivity", "Error in onServiceConnected: ${e.message}", e)
         }
-        ensureService()
     }
 
     override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
@@ -387,28 +423,36 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 val videoResolution = getSystemProperty("sys.nes.info.video_resolution").ifEmpty { detectedMediaInfo.videoResolution }
                 val frameRate = getSystemProperty("sys.nes.info.frame_rate").ifEmpty { detectedMediaInfo.frameRate }
                 val displayResolution = getSystemProperty("sys.nes.info.display_resolution")
+                    .ifEmpty { getDisplayResolutionFallback() }
                 val colorSpace = getSystemProperty("sys.nes.info.color_space")
+                    .ifEmpty { getColorSpaceFallback() }
                 val hdrStatus = getSystemProperty("sys.nes.info.hdr_status")
-                    .ifEmpty { detectedMediaInfo.hdrOutput.ifEmpty { "Unavailable" } }
+                    .ifEmpty { getHdrStatusFallback(detectedMediaInfo) }
                 val hdrPolicy = getSystemProperty("sys.nes.info.hdr_policy")
+                    .ifEmpty { getHdrPolicyFallback() }
                 val hdrPriority = getSystemProperty("sys.nes.info.hdr_priority")
+                    .ifEmpty { getHdrPriorityFallback() }
                 val digitalAudioFormat = getSystemProperty("sys.nes.info.digital_audio_format").ifEmpty { detectedMediaInfo.audioFormat }
                 val audioMode = getSystemProperty("sys.nes.info.audio_mode").ifEmpty { detectedMediaInfo.audioMode }
                 val appName = getSystemProperty("sys.nes.info.app_name")
+                    .ifEmpty { getActiveAppNameFallback() }
                 val cpuCurrPerc = printCpuCurrPerc()
                 val cpuCurrMaxPerc = printCpuCurrMaxPerc()
                 val cpuCurr = printCpuCurr()
                 val cpuCurrMax = printCpuCurrMax()
                 val cpuPercentage = printCpuPercentage()
                 val cpuUsage = getSystemProperty("sys.nes.info.cpu_usage")
+                    .ifEmpty { getCpuUsageFallback() }
                 val cpuGovernor = printCpuGovernor()
                 val memoryUsage = getSystemProperty("sys.nes.info.memory_usage")
+                    .ifEmpty { getMemoryUsageFallback() }
                 val memoryPercentage = formatMemoryUsagePercentage(memoryUsage)
                 val memoryMb = formatMemoryUsageMB(memoryUsage)
                 val memoryMbPercentage = formatMemoryUsageMBPercentage(memoryUsage)
                 val memoryGb = formatMemoryUsageGB(memoryUsage)
                 val memoryGbPercentage = formatMemoryUsageGBPercentage(memoryUsage)
                 val connectionSpeed = getSystemProperty("sys.nes.info.connection_speed")
+                    .ifEmpty { getConnectionSpeedFallback() }
                 val connectionState = getConnectionState()
                 val localTime = getCurrentTimeFormatted(applicationContext)
                 val cpuTemp = if (!isHideCpuTemperature) getHardwarePropertiesCelsius() else ""
@@ -566,7 +610,6 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                                 "ammvdec_mpeg4" -> "MPEG 4"
                                 "ammvdec_h264" -> "H.264"
                                 "ammvdec_mjpeg" -> "Motion JPEG"
-                                "ammvdec_vc1" -> "VC1"
                                 "ammvdec_avs" -> "AVS"
                                 "ammvdec_yuv" -> "YUV"
                                 "ammvdec_h264mvc" -> "H.264 MVC"
@@ -1017,6 +1060,194 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         }
     }
 
+    private fun getDisplayResolutionFallback(): String {
+        return try {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+                ?: (getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.defaultDisplay
+            val mode = display?.mode
+            if (mode != null) {
+                val width = mode.physicalWidth
+                val height = mode.physicalHeight
+                val hz = Math.round(mode.refreshRate)
+                "$width x $height, ${hz}hz"
+            } else ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getMemoryUsageFallback(): String {
+        return try {
+            val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return ""
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+            val totalMb = memoryInfo.totalMem / (1024 * 1024)
+            val availMb = memoryInfo.availMem / (1024 * 1024)
+            val usedMb = (totalMb - availMb).coerceAtLeast(0)
+            "$usedMb / $totalMb (MB)"
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getActiveAppNameFallback(): String {
+        val pkg = currentForegroundPackage ?: return ""
+        return try {
+            val pm = packageManager
+            val appInfo = pm.getApplicationInfo(pkg, 0)
+            pm.getApplicationLabel(appInfo).toString()
+        } catch (e: Exception) {
+            pkg
+        }
+    }
+
+    private var lastCpuIdleTimeUs: Long = 0L
+    private var lastCpuMeasureTimeNanos: Long = 0L
+    private var cachedRealCpuUsage: String = ""
+
+    private fun readTotalCpuIdleUs(): Long {
+        var totalIdle = 0L
+        try {
+            for (cpu in 0 until 16) {
+                val cpuIdleDir = File("/sys/devices/system/cpu/cpu$cpu/cpuidle")
+                if (!cpuIdleDir.exists()) break
+                val stateDirs = cpuIdleDir.listFiles { file -> file.isDirectory && file.name.startsWith("state") } ?: continue
+                for (stateDir in stateDirs) {
+                    val timeFile = File(stateDir, "time")
+                    if (timeFile.exists()) {
+                        val us = timeFile.readText().trim().toLongOrNull() ?: 0L
+                        totalIdle += us
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return totalIdle
+    }
+
+    private fun getCpuUsageFallback(): String {
+        return try {
+            val totalIdleUs = readTotalCpuIdleUs()
+            if (totalIdleUs > 0L) {
+                val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+                if (lastCpuMeasureTimeNanos == 0L) {
+                    lastCpuMeasureTimeNanos = nowNanos
+                    lastCpuIdleTimeUs = totalIdleUs
+                    return cachedRealCpuUsage.ifEmpty { "0%" }
+                }
+                val deltaWallTimeUs = (nowNanos - lastCpuMeasureTimeNanos) / 1000L
+                val deltaIdleUs = totalIdleUs - lastCpuIdleTimeUs
+                lastCpuMeasureTimeNanos = nowNanos
+                lastCpuIdleTimeUs = totalIdleUs
+
+                if (deltaWallTimeUs > 0) {
+                    val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+                    val totalAvailableUs = deltaWallTimeUs * cores
+                    val busyUs = (totalAvailableUs - deltaIdleUs).coerceAtLeast(0L)
+                    val usagePercent = ((busyUs.toDouble() / totalAvailableUs) * 100).toInt().coerceIn(0, 100)
+                    cachedRealCpuUsage = "$usagePercent%"
+                    return cachedRealCpuUsage
+                }
+            }
+            val freqs = getCpuFrequency()
+            val minFreqs = getMinCpuFrequency()
+            val maxFreqs = getMaxCpuFrequency()
+            if (freqs.isEmpty()) return ""
+            var totalUtil = 0
+            var count = 0
+            for (i in freqs.indices) {
+                val max = if (i < maxFreqs.size) maxFreqs[i] else 0L
+                val min = if (i < minFreqs.size) minFreqs[i] else 0L
+                if (max > min) {
+                    totalUtil += ((freqs[i] - min).toDouble() / (max - min) * 100).toInt()
+                    count++
+                }
+            }
+            if (count > 0) "${totalUtil / count}%" else ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getConnectionSpeedFallback(): String {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return ""
+            val network = cm.activeNetwork ?: return ""
+            val capabilities = cm.getNetworkCapabilities(network) ?: return ""
+            val downKbps = capabilities.linkDownstreamBandwidthKbps
+            if (downKbps > 0) {
+                val mbps = downKbps / 1000.0
+                String.format(Locale.US, "%.1f Mbps", mbps)
+            } else ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getHdrStatusFallback(detectedMediaInfo: PortableMediaInfo): String {
+        if (detectedMediaInfo.hdrOutput.isNotEmpty()) return detectedMediaInfo.hdrOutput
+        return try {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+            val types = display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf()
+            if (types.isNotEmpty()) {
+                when {
+                    Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION in types -> "Dolby Vision"
+                    Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS in types -> "HDR10+"
+                    Display.HdrCapabilities.HDR_TYPE_HDR10 in types -> "HDR10"
+                    Display.HdrCapabilities.HDR_TYPE_HLG in types -> "HLG"
+                    else -> "SDR"
+                }
+            } else "SDR"
+        } catch (e: Exception) {
+            "Unavailable"
+        }
+    }
+
+    private fun getColorSpaceFallback(): String {
+        return try {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+            if (display?.isWideColorGamut == true) {
+                "BT.2020 / DCI-P3"
+            } else {
+                "RGB (8 Bit)"
+            }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getHdrPolicyFallback(): String {
+        return try {
+            val matchContent = Settings.Global.getInt(contentResolver, "match_content_dynamic_range", -1)
+            when (matchContent) {
+                0 -> getString(R.string.follow_sink)
+                1 -> getString(R.string.follow_source)
+                else -> ""
+            }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun getHdrPriorityFallback(): String {
+        return try {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+            val types = display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf()
+            if (Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION in types) {
+                "Dolby Vision"
+            } else if (Display.HdrCapabilities.HDR_TYPE_HDR10 in types) {
+                "HDR10"
+            } else {
+                ""
+            }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
     private suspend fun getPortableMediaInfo(): PortableMediaInfo {
         if (System.currentTimeMillis() - portableMediaInfoUpdatedAt < 2_000) {
             return portableMediaInfo
@@ -1025,20 +1256,34 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         return withContext(Dispatchers.IO) {
             try {
                 val activeConnection = connection ?: return@withContext portableMediaInfo
-                val hdrOutput = HdrOutputParser.parse(readAdbCommand(activeConnection,
-                    "cat /sys/class/amhdmitx/amhdmitx0/hdmi_hdr_status 2>/dev/null"))
+                val hdrCommands = listOf(
+                    "cat /sys/class/amhdmitx/amhdmitx0/hdmi_hdr_status 2>/dev/null",
+                    "cat /sys/devices/virtual/hdmitx/hdmitx0/hdmi_hdr_status 2>/dev/null",
+                    "cat /sys/class/hdmitx/hdmitx0/hdmi_hdr_status 2>/dev/null"
+                )
+                var rawHdr = ""
+                for (cmd in hdrCommands) {
+                    val out = readAdbCommand(activeConnection, cmd).trim()
+                    if (out.isNotEmpty() && !out.contains("No such file") && !out.contains("denied")) {
+                        rawHdr = out
+                        break
+                    }
+                }
+                val hdrOutput = HdrOutputParser.parse(rawHdr)
                 val resources = readAdbCommand(activeConnection, "dumpsys media.resource_manager")
                     .substringBefore("Process Pid override:").substringBefore("Events logs:")
                 val audio = readAdbCommand(activeConnection, "dumpsys media.audio_flinger")
                 val playerPid = resources.split("\n    Pid:")
-                    .firstOrNull { "video-codec" in it && "Name: c2." in it }
+                    .firstOrNull { "video-codec" in it && ("Name: c2." in it || "Name: OMX." in it) }
                     ?.lineSequence()?.firstOrNull()?.trim()?.toIntOrNull()
                 val logs = playerPid?.let { pid ->
                     // Collect only media tags, never account/URL/authorization logs.
                     readAdbCommand(activeConnection, "logcat -d -v threadtime --pid=$pid -t 4000 -s CCodec:D CCodecConfig:D EventLogger:D PlayerEventListener:I")
                 }.orEmpty()
 
-                PortableMediaInfoParser.parse(resources, audio, logs).copy(hdrOutput = hdrOutput).also {
+                val parsed = PortableMediaInfoParser.parse(resources, audio, logs)
+                val finalHdr = hdrOutput.ifEmpty { parsed.hdrOutput }
+                parsed.copy(hdrOutput = finalHdr).also {
                     portableMediaInfo = it
                     portableMediaInfoUpdatedAt = System.currentTimeMillis()
                 }
@@ -1484,13 +1729,13 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         val governorFilePath = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
         return try {
             val file = File(governorFilePath)
-            if (file.exists()) {
+            if (file.exists() && file.canRead()) {
                 file.readText().trim()
             } else {
-                "Governor file does not exist"
+                ""
             }
         } catch (e: Exception) {
-            "Error reading governor: ${e.message}"
+            ""
         }
     }
 
@@ -1596,9 +1841,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     }
 
     suspend fun adbCommander(ip: String?) {
-        val socket = withContext(Dispatchers.IO) {
-            Socket(ip, 5555)
-        }
+        val targetIp = ip ?: "127.0.0.1"
         val crypto = readCryptoConfig(filesDir) ?: writeNewCryptoConfig(filesDir)
 
         if (crypto == null) {
@@ -1606,25 +1849,38 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
             return
         }
 
-        try {
-            if (stream == null || connection == null) {
-                connection = AdbConnection.create(socket, crypto)
-                connection?.connect()
+        withContext(Dispatchers.IO) {
+            try {
+                if (stream == null || connection == null) {
+                    val socket = try {
+                        Socket(targetIp, 5555)
+                    } catch (e: Exception) {
+                        if (targetIp != "127.0.0.1") Socket("127.0.0.1", 5555) else throw e
+                    }
+                    val adbConn = AdbConnection.create(socket, crypto)
+                    adbConn.connect()
+                    connection = adbConn
+                }
+            } catch (e: InterruptedException) {
+                e.printStackTrace()
+                Thread.currentThread().interrupt()
+            } catch (e: Exception) {
+                Log.d("MainActivity", "Local ADB connection failed: ${e.message}")
             }
-        } catch (e: InterruptedException) {
-            e.printStackTrace()
-            Thread.currentThread().interrupt()
+            Unit
         }
     }
 
     private suspend fun appMemoryUsage(): String {
         return withContext(Dispatchers.IO) {
             try {
-                val appName = getSystemProperty("sys.nes.info.app_name")
-                val memoryUsageStream = connection?.open("shell:dumpsys meminfo $appName | awk '/TOTAL PSS/ {printf \"%.0f MB\", \$3/1024}'")
+                val appTarget = currentForegroundPackage
+                    ?: getSystemProperty("sys.nes.info.app_name")
+                if (appTarget.isEmpty()) return@withContext "-- MB"
+                val memoryUsageStream = connection?.open("shell:dumpsys meminfo $appTarget | awk '/TOTAL PSS/ {printf \"%.0f MB\", \$3/1024}'")
                 val memoryUsageOutputBytes = memoryUsageStream?.read()
 
-                return@withContext memoryUsageOutputBytes?.decodeToString() ?: "-- MB"
+                return@withContext memoryUsageOutputBytes?.decodeToString()?.trim()?.ifEmpty { "-- MB" } ?: "-- MB"
             } catch (e: Exception) {
                 e.printStackTrace()
                 return@withContext "-- MB"
@@ -1781,13 +2037,15 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         activeService = null
         removeOverlay()
         myAsyncTask?.cancel()
-        connection?.close()
+        runCatching { connection?.close() }
         serviceConnection?.let { runCatching { unbindService(it) } }
-        debugToggleReceiver?.let { unregisterReceiver(it) }
+        debugToggleReceiver?.let { runCatching { unregisterReceiver(it) } }
         debugToggleReceiver = null
 
-        PreferenceManager.getDefaultSharedPreferences(this)
-            .unregisterOnSharedPreferenceChangeListener(this)
+        runCatching {
+            PreferenceManager.getDefaultSharedPreferences(this)
+                .unregisterOnSharedPreferenceChangeListener(this)
+        }
     }
 
     class AndroidBase64 : AdbBase64 {
