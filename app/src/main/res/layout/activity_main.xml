@@ -5,20 +5,30 @@
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <TextView
-        android:id="@+id/overlayTextView"
+    <!-- A shared row gives both backgrounds the same measured height, even
+         when one column has fewer lines or a value wraps. -->
+    <LinearLayout
+        android:id="@+id/overlayColumns"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_alignParentTop="true"
         android:layout_alignParentEnd="true"
-        android:padding="12dp"
-        android:text="@string/starting" />
+        android:orientation="horizontal"
+        android:baselineAligned="false">
 
-    <TextView
-        android:id="@+id/overlayTextView2"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_alignParentTop="true"
-        android:layout_toStartOf="@id/overlayTextView" />
+        <TextView
+            android:id="@+id/overlayTextView2"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="top" />
+
+        <TextView
+            android:id="@+id/overlayTextView"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="top"
+            android:padding="12dp"
+            android:text="@string/starting" />
+    </LinearLayout>
 
 </RelativeLayout>

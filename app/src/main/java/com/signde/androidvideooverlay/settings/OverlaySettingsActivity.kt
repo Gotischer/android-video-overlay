@@ -1,11 +1,11 @@
-package com.jamal2367.videoinfooverlay.settings
+package com.signde.androidvideooverlay.settings
 
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.PreferenceFragmentCompat
-import com.jamal2367.videoinfooverlay.R
+import com.signde.androidvideooverlay.R
 
-class BackgroundSettingsActivity : AppCompatActivity() {
+class OverlaySettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         supportFragmentManager.beginTransaction().replace(android.R.id.content, SettingsFragment()).commit()
@@ -13,7 +13,7 @@ class BackgroundSettingsActivity : AppCompatActivity() {
 
     class SettingsFragment : PreferenceFragmentCompat() {
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
-            setPreferencesFromResource(R.xml.activity_settings_background, rootKey)
+            setPreferencesFromResource(R.xml.activity_settings_overlay, rootKey)
 
         }
     }

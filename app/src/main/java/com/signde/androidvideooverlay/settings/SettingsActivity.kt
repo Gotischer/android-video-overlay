@@ -1,15 +1,27 @@
-package com.jamal2367.videoinfooverlay.settings
+package com.signde.androidvideooverlay.settings
 
 import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
+import com.signde.androidvideooverlay.MainActivity
+import com.signde.androidvideooverlay.ToggleActivity
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
-import com.jamal2367.videoinfooverlay.R
+import com.signde.androidvideooverlay.R
 
 class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Older onn Favorites assignments may retain this former launcher
+        // component. Preserve that assignment, but give it toggle behavior.
+        if (intent.action == Intent.ACTION_MAIN &&
+            (intent.hasCategory(Intent.CATEGORY_LEANBACK_LAUNCHER) ||
+                intent.hasCategory(Intent.CATEGORY_LAUNCHER))) {
+            startActivity(Intent(this, ToggleActivity::class.java))
+            finish()
+            return
+        }
         supportFragmentManager.beginTransaction().replace(android.R.id.content, SettingsFragment()).commit()
     }
 
@@ -25,6 +37,13 @@ class SettingsActivity : AppCompatActivity() {
 
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             setPreferencesFromResource(R.xml.activity_settings, rootKey)
+
+            findPreference<Preference>("toggle_overlay")?.setOnPreferenceClickListener {
+                val service = MainActivity.activeService
+                if (service == null) startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                else service.toggleOverlay()
+                true
+            }
 
             overlayOptionsPreference = findPreference("overlay_options_activity")
             backgroundOptionsPreference = findPreference("background_options_activity")

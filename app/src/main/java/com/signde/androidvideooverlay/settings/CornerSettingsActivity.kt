@@ -1,11 +1,11 @@
-package com.jamal2367.videoinfooverlay.settings
+package com.signde.androidvideooverlay.settings
 
 import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.CheckBoxPreference
 import androidx.preference.PreferenceFragmentCompat
-import com.jamal2367.videoinfooverlay.R
+import com.signde.androidvideooverlay.R
 
 class CornerSettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

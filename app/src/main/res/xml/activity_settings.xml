@@ -3,6 +3,11 @@
     <PreferenceCategory android:title="@string/settings">
 
         <Preference
+            android:key="toggle_overlay"
+            android:title="Show / hide overlay"
+            android:summary="Toggle visibility, then return to your player." />
+
+        <Preference
             android:key="overlay_options_activity"
             android:title="@string/overlay_options"
             android:icon="@drawable/ic_overlay_24dp"/>

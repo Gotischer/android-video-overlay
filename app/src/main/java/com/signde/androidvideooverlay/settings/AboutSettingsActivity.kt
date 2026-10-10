@@ -1,11 +1,11 @@
-package com.jamal2367.videoinfooverlay.settings
+package com.signde.androidvideooverlay.settings
 
 import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
-import com.jamal2367.videoinfooverlay.R
+import com.signde.androidvideooverlay.R
 
 class AboutSettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -24,7 +24,7 @@ class AboutSettingsActivity : AppCompatActivity() {
             val versionName = packageInfo.versionName
 
             preferenceAppVersion?.title = getString(R.string.app_name) + " $versionName"
-            preferenceAppVersion?.summary = "https://github.com/jamal2362/SEI804_VideoInfoOverlay"
+            preferenceAppVersion?.summary = getString(R.string.app_attribution)
             preferenceAppVersion?.setIcon(R.drawable.ic_info_24dp)
             preferenceAppVersion?.setOnPreferenceClickListener {
                 Toast.makeText(requireContext(), "❤", Toast.LENGTH_LONG).show()

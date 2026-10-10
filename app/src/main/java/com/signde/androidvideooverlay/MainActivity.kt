@@ -1,9 +1,12 @@
-package com.jamal2367.videoinfooverlay
+package com.signde.androidvideooverlay
 
 import android.accessibilityservice.AccessibilityService
 import android.content.ComponentName
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -37,6 +40,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.ByteArrayOutputStream
 import java.lang.ref.WeakReference
 import java.net.Socket
 import java.text.DecimalFormat
@@ -48,20 +52,32 @@ import android.text.format.DateFormat as AndroidDateFormat
 
 
 class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenceChangeListener {
+    companion object {
+        var activeService: MainActivity? = null
+            private set
+    }
+
+    fun toggleOverlay() {
+        if (overlayView == null) createOverlay() else removeOverlay()
+    }
     private lateinit var overlayTextView: TextView
     private lateinit var overlayTextView2: TextView
     private lateinit var sharedPreferences: SharedPreferences
 
     private var standardKeyCode: Int = KeyEvent.KEYCODE_BOOKMARK
     private var overlayView: View? = null
-    private var lastKeyDownTime: Long = 0
+    private val shortcut = OverlayShortcut()
     private var serviceBinder: IBinder? = null
     private var serviceConnection: ServiceConnection? = null
     private val lock = Any()
     private val handler = Handler(Looper.getMainLooper())
     private var connection: AdbConnection? = null
     private var stream: AdbStream? = null
+    @Volatile private var portableMediaInfo = PortableMediaInfo()
+    @Volatile private var portableMediaInfoUpdatedAt = 0L
     private var myAsyncTask: MyAsyncTask? = null
+    private var updateJob: Job? = null
+    private var debugToggleReceiver: BroadcastReceiver? = null
     private val ipAddress = "0.0.0.0"
     private var requestKey= "request_key"
     private var celFahrKey= "celsius_fahrenheit_key"
@@ -165,41 +181,18 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     }
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (!::sharedPreferences.isInitialized) return false
+        if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) return false
         val isLongPress = sharedPreferences.getBoolean(longPressKey, false)
-
-        if (event.keyCode == standardKeyCode) {
-            if (event.action == KeyEvent.ACTION_DOWN) {
-                lastKeyDownTime = System.currentTimeMillis()
-                return true
-            } else if (event.action == KeyEvent.ACTION_UP) {
-                val currentTime = System.currentTimeMillis()
-                val pressDuration = currentTime - lastKeyDownTime
-
-                if (pressDuration >= 750) {
-                    if (isLongPress) {
-                        if (overlayView != null) {
-                            removeOverlay()
-                            Log.d("TAG", "Overlay removed")
-                        } else {
-                            createOverlay()
-                            Log.d("TAG", "Overlay started")
-                        }
-                    }
-                } else {
-                    if (!isLongPress) {
-                        if (overlayView != null) {
-                            removeOverlay()
-                            Log.d("TAG", "Overlay removed")
-                        } else {
-                            createOverlay()
-                            Log.d("TAG", "Overlay started")
-                        }
-                    }
-                }
-                return true
-            }
+        val result = shortcut.handle(event.keyCode, event.action == KeyEvent.ACTION_DOWN,
+            event.repeatCount, event.eventTime - event.downTime, event.isCanceled,
+            standardKeyCode, isLongPress)
+        if (result.toggle) {
+            Log.d("OverlayShortcut", "Toggling from key ${event.keyCode}")
+            // Acknowledge the key promptly, before overlay creation/ADB work.
+            handler.post { toggleOverlay() }
         }
-        return super.onKeyEvent(event)
+        return result.consumed
     }
 
     private fun isUsbDebuggingEnabled(): Boolean {
@@ -208,27 +201,18 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
     private fun createOverlay() {
         val isHideLeftOverlay = sharedPreferences.getBoolean(hideLeftOverlay, false)
-        val isHideCpuTemperature = sharedPreferences.getBoolean(textHideCpuTemperatureKey, true)
-        val isHideAppMemoryUsage = sharedPreferences.getBoolean(textHideAppMemoryUsageKey, true)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         )
 
         if (isUsbDebuggingEnabled()) {
-            if (!isHideCpuTemperature || !isHideAppMemoryUsage) {
-                onKeyCE()
-            } else {
-                connection = null
-                stream = null
-
-                myAsyncTask = MyAsyncTask(this)
-                myAsyncTask?.cancel()
-            }
+            // Portable media detection also uses this local ADB connection.
+            onKeyCE()
         }
 
         overlayView = View.inflate(this, R.layout.activity_main, null)
@@ -261,6 +245,8 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     }
 
     private fun removeOverlay() {
+        handler.removeCallbacks(updateData)
+        updateJob?.cancel()
         if (overlayView != null) {
             val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
             windowManager.removeView(overlayView)
@@ -279,8 +265,24 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        activeService = this
         Log.d("TAG", "onServiceConnected")
 
+        // The NES companion service is optional on non-SEI Android TV devices.
+        updateOverlayKeyButton()
+        val isDebuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        if (isDebuggable && debugToggleReceiver == null) {
+            debugToggleReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (overlayView == null) createOverlay() else removeOverlay()
+                }
+            }
+            registerReceiver(
+                debugToggleReceiver,
+                IntentFilter("com.signde.androidvideooverlay.DEBUG_TOGGLE"),
+                Context.RECEIVER_EXPORTED
+            )
+        }
         ensureService()
     }
 
@@ -348,7 +350,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
     private val updateData: Runnable by lazy {
         Runnable {
-            CoroutineScope(Dispatchers.Main).launch {
+            updateJob = CoroutineScope(Dispatchers.Main).launch {
                 val isEmptyLine = sharedPreferences.getBoolean(emptyLineKey, false)
                 val isTitleLine = sharedPreferences.getBoolean(emptyTitleKey, false)
                 val isHideVideoTitle = sharedPreferences.getBoolean(textHideVideoTitleKey, false)
@@ -380,16 +382,18 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 val isHideAppMemoryUsage = sharedPreferences.getBoolean(textHideAppMemoryUsageKey, true)
                 val isRequest = sharedPreferences.getBoolean(requestKey, false)
                 val isCelFahr = sharedPreferences.getBoolean(celFahrKey, false)
-                val videoFormat = getSystemProperty("sys.nes.info.video_format")
-                val videoResolution = getSystemProperty("sys.nes.info.video_resolution")
-                val frameRate = getSystemProperty("sys.nes.info.frame_rate")
+                val detectedMediaInfo = getPortableMediaInfo()
+                val videoFormat = getSystemProperty("sys.nes.info.video_format").ifEmpty { detectedMediaInfo.videoFormat }
+                val videoResolution = getSystemProperty("sys.nes.info.video_resolution").ifEmpty { detectedMediaInfo.videoResolution }
+                val frameRate = getSystemProperty("sys.nes.info.frame_rate").ifEmpty { detectedMediaInfo.frameRate }
                 val displayResolution = getSystemProperty("sys.nes.info.display_resolution")
                 val colorSpace = getSystemProperty("sys.nes.info.color_space")
                 val hdrStatus = getSystemProperty("sys.nes.info.hdr_status")
+                    .ifEmpty { detectedMediaInfo.hdrOutput.ifEmpty { "Unavailable" } }
                 val hdrPolicy = getSystemProperty("sys.nes.info.hdr_policy")
                 val hdrPriority = getSystemProperty("sys.nes.info.hdr_priority")
-                val digitalAudioFormat = getSystemProperty("sys.nes.info.digital_audio_format")
-                val audioMode = getSystemProperty("sys.nes.info.audio_mode")
+                val digitalAudioFormat = getSystemProperty("sys.nes.info.digital_audio_format").ifEmpty { detectedMediaInfo.audioFormat }
+                val audioMode = getSystemProperty("sys.nes.info.audio_mode").ifEmpty { detectedMediaInfo.audioMode }
                 val appName = getSystemProperty("sys.nes.info.app_name")
                 val cpuCurrPerc = printCpuCurrPerc()
                 val cpuCurrMaxPerc = printCpuCurrMaxPerc()
@@ -405,9 +409,10 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 val memoryGb = formatMemoryUsageGB(memoryUsage)
                 val memoryGbPercentage = formatMemoryUsageGBPercentage(memoryUsage)
                 val connectionSpeed = getSystemProperty("sys.nes.info.connection_speed")
+                val connectionState = getConnectionState()
                 val localTime = getCurrentTimeFormatted(applicationContext)
-                val cpuTemp = getHardwarePropertiesCelsius()
-                val appMemoryUsage = getAppMemoryUsage()
+                val cpuTemp = if (!isHideCpuTemperature) getHardwarePropertiesCelsius() else ""
+                val appMemoryUsage = if (!isHideAppMemoryUsage && appName.isNotEmpty()) getAppMemoryUsage() else ""
 
                 val overlayText = buildString {
                     if (!isHideVideoTitle) {
@@ -576,6 +581,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                             appendLine(modifiedVideoFormat)
                         }
                     }
+                    if (!isHideVideoFormat) appendLine(detectedMediaInfo.videoBitrate.ifEmpty { "Unavailable" })
 
                     if (!isHideEmptyVideoAudioLine && !isEmptyLine) {
                         appendLine()
@@ -621,6 +627,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                             appendLine(modifiedDigitalAudioFormat)
                         }
                     }
+                    if (!isHideAudioFormat) appendLine(detectedMediaInfo.audioBitrate.ifEmpty { "Unavailable" })
 
                     if (!isHideEmptyAudioDisplayLine && !isEmptyLine) {
                         appendLine()
@@ -758,14 +765,18 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                     }
 
                     if (!isHideConnection) {
-                        if (getConnectionState().isNotEmpty()) {
-                            val modifiedgetConnectionState = when (getConnectionState().trim()) {
+                        if (connectionState.isNotEmpty()) {
+                            val modifiedgetConnectionState = when (connectionState.trim()) {
                                 "WIFI" -> getString(R.string.wifi)
                                 "Ethernet" -> getString(R.string.ethernet)
-                                else -> getConnectionState()
+                                else -> connectionState
                             }
 
-                            if (connectionSpeed.isNotEmpty()) {
+                            if (connectionSpeed.isEmpty()) {
+                                // Non-SEI devices have connectivity but no NES speed
+                                // property. Keep the value row paired with its label.
+                                appendLine(modifiedgetConnectionState)
+                            } else {
                                 val isMbpsText = sharedPreferences.getBoolean(textMbpsKey, false)
 
                                 if (isMbpsText) {
@@ -845,6 +856,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                             appendLine(getString(R.string.video_format))
                         }
                     }
+                    if (!isHideVideoFormat) appendLine("Video Bitrate:")
 
                     if (!isHideEmptyVideoAudioLine && !isEmptyLine) {
                         appendLine()
@@ -858,7 +870,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
                     if (!isHideAudioMode) {
                         if (audioMode.isNotEmpty()) {
-                            appendLine(getString(R.string.audio_mode))
+                            appendLine(if (detectedMediaInfo.audioModeIsOutput && audioMode == detectedMediaInfo.audioMode) "Audio Output:" else getString(R.string.audio_mode))
                         }
                     }
 
@@ -867,6 +879,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                             appendLine(getString(R.string.audio_format))
                         }
                     }
+                    if (!isHideAudioFormat) appendLine("Audio Bitrate:")
 
                     if (!isHideEmptyAudioDisplayLine && !isEmptyLine) {
                         appendLine()
@@ -880,7 +893,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
                     if (!isHideHdrStatus) {
                         if (hdrStatus.isNotEmpty()) {
-                            appendLine(getString(R.string.hdr_status))
+                            appendLine("HDR Output:")
                         }
                     }
 
@@ -953,7 +966,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                     }
 
                     if (!isHideConnection) {
-                        if (getConnectionState().isNotEmpty()) {
+                        if (connectionState.isNotEmpty()) {
                             appendLine(getString(R.string.connection))
 
                         }
@@ -1004,7 +1017,53 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         }
     }
 
+    private suspend fun getPortableMediaInfo(): PortableMediaInfo {
+        if (System.currentTimeMillis() - portableMediaInfoUpdatedAt < 2_000) {
+            return portableMediaInfo
+        }
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val activeConnection = connection ?: return@withContext portableMediaInfo
+                val hdrOutput = HdrOutputParser.parse(readAdbCommand(activeConnection,
+                    "cat /sys/class/amhdmitx/amhdmitx0/hdmi_hdr_status 2>/dev/null"))
+                val resources = readAdbCommand(activeConnection, "dumpsys media.resource_manager")
+                    .substringBefore("Process Pid override:").substringBefore("Events logs:")
+                val audio = readAdbCommand(activeConnection, "dumpsys media.audio_flinger")
+                val playerPid = resources.split("\n    Pid:")
+                    .firstOrNull { "video-codec" in it && "Name: c2." in it }
+                    ?.lineSequence()?.firstOrNull()?.trim()?.toIntOrNull()
+                val logs = playerPid?.let { pid ->
+                    // Collect only media tags, never account/URL/authorization logs.
+                    readAdbCommand(activeConnection, "logcat -d -v threadtime --pid=$pid -t 4000 -s CCodec:D CCodecConfig:D EventLogger:D PlayerEventListener:I")
+                }.orEmpty()
+
+                PortableMediaInfoParser.parse(resources, audio, logs).copy(hdrOutput = hdrOutput).also {
+                    portableMediaInfo = it
+                    portableMediaInfoUpdatedAt = System.currentTimeMillis()
+                }
+            } catch (e: Exception) {
+                Log.w("PortableMediaInfo", "Unable to read portable media diagnostics", e)
+                PortableMediaInfo().also { portableMediaInfo = it }
+            }
+        }
+    }
+
+    private fun readAdbCommand(activeConnection: AdbConnection, command: String): String {
+        val adbStream = activeConnection.open("shell:$command")
+        val output = ByteArrayOutputStream()
+        while (!adbStream.isClosed) {
+            try {
+                output.write(adbStream.read())
+            } catch (e: IOException) {
+                if (!adbStream.isClosed) throw e
+            }
+        }
+        return output.toByteArray().decodeToString()
+    }
+
     private fun updateOverlayKeyButton() {
+        shortcut.reset()
         sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this)
 
         val keyCodesArray = resources.getStringArray(R.array.key_codes)
@@ -1066,9 +1125,10 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
             val scale = resources.displayMetrics.density
             val marginWidthInPx = (marginWidth * scale + 0.5f).toInt()
 
-            val params1 = overlayTextView.layoutParams as ViewGroup.MarginLayoutParams
+            val columns = overlayView?.findViewById<View>(R.id.overlayColumns) ?: return
+            val params1 = columns.layoutParams as ViewGroup.MarginLayoutParams
             params1.rightMargin = marginWidthInPx
-            overlayTextView.layoutParams = params1
+            columns.layoutParams = params1
         }
     }
 
@@ -1080,13 +1140,10 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
             val scale = resources.displayMetrics.density
             val marginHeightInPx = (marginHeight * scale + 0.5f).toInt()
 
-            val params1 = overlayTextView.layoutParams as ViewGroup.MarginLayoutParams
+            val columns = overlayView?.findViewById<View>(R.id.overlayColumns) ?: return
+            val params1 = columns.layoutParams as ViewGroup.MarginLayoutParams
             params1.topMargin = marginHeightInPx
-            overlayTextView.layoutParams = params1
-
-            val params2 = overlayTextView2.layoutParams as ViewGroup.MarginLayoutParams
-            params2.topMargin = marginHeightInPx
-            overlayTextView2.layoutParams = params2
+            columns.layoutParams = params1
         }
     }
 
@@ -1532,11 +1589,9 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     }
 
     private fun onKeyCE() {
-        connection = null
-        stream = null
-
-        myAsyncTask = MyAsyncTask(this)
+        if (connection != null) return
         myAsyncTask?.cancel()
+        myAsyncTask = MyAsyncTask(this)
         myAsyncTask?.execute(ipAddress)
     }
 
@@ -1723,7 +1778,13 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceConnection?.let { unbindService(it) }
+        activeService = null
+        removeOverlay()
+        myAsyncTask?.cancel()
+        connection?.close()
+        serviceConnection?.let { runCatching { unbindService(it) } }
+        debugToggleReceiver?.let { unregisterReceiver(it) }
+        debugToggleReceiver = null
 
         PreferenceManager.getDefaultSharedPreferences(this)
             .unregisterOnSharedPreferenceChangeListener(this)
