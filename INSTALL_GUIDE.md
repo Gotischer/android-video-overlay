@@ -54,10 +54,6 @@ Si ya instalaste el APK y al ir a **Accesibilidad** el interruptor **se apaga so
    ```bash
    adb shell appops set com.signde.androidvideooverlay ACCESS_RESTRICTED_SETTINGS allow
    ```
-   *(O si prefieres encenderlo directamente por comando sin tocar el menú:)*
-   ```bash
-   adb shell settings put secure enabled_accessibility_services com.signde.androidvideooverlay/com.signde.androidvideooverlay.MainActivity
-   ```
 
 ---
 
@@ -129,10 +125,6 @@ If you already installed the APK and in **Accessibility** the toggle **flips bac
 2. Run this command to allow the accessibility toggle to stay ON:
    ```bash
    adb shell appops set com.signde.androidvideooverlay ACCESS_RESTRICTED_SETTINGS allow
-   ```
-   *(Or enable the service directly without navigating menus:)*
-   ```bash
-   adb shell settings put secure enabled_accessibility_services com.signde.androidvideooverlay/com.signde.androidvideooverlay.MainActivity
    ```
 
 ---

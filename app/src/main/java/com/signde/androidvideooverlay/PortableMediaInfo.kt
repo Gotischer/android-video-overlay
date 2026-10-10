@@ -11,8 +11,28 @@ data class PortableMediaInfo(
     val videoBitrate: String = "",
     val audioBitrate: String = "",
     val audioModeIsOutput: Boolean = false,
-    val hdrOutput: String = ""
+    val hdrOutput: String = "",
+    val videoHdr: String = "",
+    val colorSpace: String = ""
 )
+
+/** Parses live HDMI attribute on Amlogic/supported devices (e.g. 420,10bit). */
+object HdmiColorSettingParser {
+    fun parse(status: String): String {
+        val trimmed = status.trim().lowercase()
+        if (trimmed.isEmpty() || trimmed.contains("no such") || trimmed.contains("denied")) return ""
+        val parts = trimmed.split(',')
+        val format = when (parts[0].trim()) {
+            "420" -> "YCbCr420"
+            "422" -> "YCbCr422"
+            "444" -> "YCbCr444"
+            "rgb" -> "RGB"
+            else -> return ""
+        }
+        val bit = if (parts.size > 1) parts[1].trim() else "8bit"
+        return "$format $bit"
+    }
+}
 
 /** Amlogic, MediaTek and live HDMI transmitter status, not EDID capabilities or codec support. */
 object HdrOutputParser {
@@ -58,7 +78,7 @@ object PortableMediaInfoParser {
             ?: Regex("""(?:frame_rate|fps)=([\d.]+)""").find(matchingTrack)?.groupValues?.get(1).orEmpty()
         val audioMime = audioEvent?.groupValues?.get(1)
             ?: Regex("""mimeType=([^, ]+)""").find(audioTrack)?.groupValues?.get(1).orEmpty()
-        val logHdr = detectHdrFromLogcat(logcat, videoTrack)
+        val streamHdr = detectHdrFromLogcat(logcat, decoder, videoTrack)
         return PortableMediaInfo(
             videoFormat = if (hasActiveVideoDecoder) friendlyVideoFormat(decoder.substringBefore(".decoder").substringAfterLast('.')) else "",
             videoResolution = if (hasActiveVideoDecoder) resolution else "",
@@ -68,7 +88,8 @@ object PortableMediaInfoParser {
             videoBitrate = if (hasActiveVideoDecoder) formatBitrate(matchingEvent?.groupValues?.get(3) ?: bitrate(matchingTrack), true) else "",
             audioBitrate = if (activeOutput.first.isNotEmpty()) formatBitrate(audioEvent?.groupValues?.get(2) ?: bitrate(audioTrack), false) else "",
             audioModeIsOutput = activeOutput.first.isNotEmpty() && audioMime.isEmpty(),
-            hdrOutput = logHdr
+            videoHdr = streamHdr,
+            hdrOutput = ""
         )
     }
 
@@ -126,16 +147,44 @@ object PortableMediaInfoParser {
         return format to mode
     }
 
-    private fun detectHdrFromLogcat(log: String, videoTrack: String): String {
-        val lowerLog = log.lowercase()
-        val lowerTrack = videoTrack.lowercase()
-        return when {
-            "dolby-vision" in lowerLog || "dvhe" in lowerTrack || "dvh1" in lowerTrack -> "Dolby Vision"
-            "hdr10plus" in lowerLog || "hdr10+" in lowerTrack -> "HDR10+"
-            "transfer: 6" in log || "transfer = 6" in log || "color-transfer=6" in lowerTrack -> "HDR10"
-            "transfer: 7" in log || "transfer = 7" in log || "color-transfer=7" in lowerTrack -> "HLG"
-            else -> ""
+    private fun detectHdrFromLogcat(log: String, decoder: String, videoTrack: String): String {
+        // 1. Only inspect videoTrack if it's selected and supported
+        if (videoTrack.isNotEmpty() && !videoTrack.contains("supported=NO")) {
+            val lowerTrack = videoTrack.lowercase()
+            when {
+                "dolby-vision" in lowerTrack || "dvhe" in lowerTrack || "dvh1" in lowerTrack -> return "Dolby Vision"
+                "hdr10plus" in lowerTrack || "hdr10+" in lowerTrack -> return "HDR10+"
+                "color-transfer=6" in lowerTrack -> return "HDR10"
+                "color-transfer=7" in lowerTrack -> return "HLG"
+            }
         }
+
+        // 2. Scope to current active decoder instance in logcat
+        if (decoder.isNotEmpty()) {
+            val lines = log.lines()
+            val start = lines.indexOfLast { "allocate($decoder)" in it }
+            val scanLines = if (start >= 0) lines.drop(start) else lines
+            val prefix = Regex("""^\S+\s+\S+\s+(\d+)\s+(\d+)\s""")
+            val thread = if (start >= 0) prefix.find(lines[start])?.groupValues?.get(2) else null
+
+            var activeTransfer: String? = null
+            for (line in scanLines) {
+                if (thread != null && prefix.find(line)?.groupValues?.get(2) != thread) {
+                    if (!line.contains("CCodecConfig") && !line.contains("CCodec")) continue
+                }
+                val transferMatch = Regex("""coded\.vui\.color\.transfer\s*=\s*(\d+)""").find(line)
+                    ?: Regex("""(?:color[.-])?transfer\s*[=:]\s*(\d+)""").find(line)
+                if (transferMatch != null) {
+                    activeTransfer = transferMatch.groupValues[1]
+                }
+            }
+            when (activeTransfer) {
+                "6" -> return "HDR10"
+                "7" -> return "HLG"
+                "1", "2", "3" -> return ""
+            }
+        }
+        return ""
     }
 
     private fun friendlyVideoFormat(value: String): String {

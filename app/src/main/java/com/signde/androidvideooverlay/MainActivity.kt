@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -15,6 +16,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.net.ConnectivityManager
+import android.net.TrafficStats
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -27,6 +29,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import androidx.core.content.res.ResourcesCompat
 import androidx.core.graphics.ColorUtils
@@ -140,15 +143,36 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
     private val textHideAppMemoryUsageKey = "pref_hide_app_memory_usage_key"
 
     private var currentForegroundPackage: String? = null
+    @Volatile private var activePlayerPackage: String? = null
+
+    private fun isSystemComponent(pkg: String): Boolean {
+        return pkg == packageName ||
+            pkg == "android" ||
+            pkg.startsWith("com.android.systemui") ||
+            pkg.startsWith("com.droidlogic") ||
+            pkg.startsWith("com.google.android.tv.frameworkpackagestubs") ||
+            pkg.startsWith("com.google.android.katniss") ||
+            pkg.startsWith("com.google.android.tungsten.setupwraith")
+    }
+
+    private fun isLauncherPackage(pkg: String): Boolean {
+        if (pkg.contains("launcher", ignoreCase = true) || pkg.contains("tv.home", ignoreCase = true)) return true
+        return try {
+            val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            val defaultHome = packageManager.resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName
+            defaultHome == pkg
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val pkg = event.packageName?.toString()
-            if (!pkg.isNullOrEmpty() &&
-                pkg != packageName &&
-                !pkg.contains("systemui", ignoreCase = true) &&
-                !pkg.contains("launcher", ignoreCase = true)
-            ) {
+            val pkg = event.packageName?.toString() ?: return
+            if (isSystemComponent(pkg)) return
+            if (isLauncherPackage(pkg)) {
+                currentForegroundPackage = null
+            } else {
                 currentForegroundPackage = pkg
             }
         }
@@ -425,13 +449,12 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 val displayResolution = getSystemProperty("sys.nes.info.display_resolution")
                     .ifEmpty { getDisplayResolutionFallback() }
                 val colorSpace = getSystemProperty("sys.nes.info.color_space")
-                    .ifEmpty { getColorSpaceFallback() }
+                    .ifEmpty { detectedMediaInfo.colorSpace }
                 val hdrStatus = getSystemProperty("sys.nes.info.hdr_status")
-                    .ifEmpty { getHdrStatusFallback(detectedMediaInfo) }
+                    .ifEmpty { detectedMediaInfo.hdrOutput }
                 val hdrPolicy = getSystemProperty("sys.nes.info.hdr_policy")
                     .ifEmpty { getHdrPolicyFallback() }
                 val hdrPriority = getSystemProperty("sys.nes.info.hdr_priority")
-                    .ifEmpty { getHdrPriorityFallback() }
                 val digitalAudioFormat = getSystemProperty("sys.nes.info.digital_audio_format").ifEmpty { detectedMediaInfo.audioFormat }
                 val audioMode = getSystemProperty("sys.nes.info.audio_mode").ifEmpty { detectedMediaInfo.audioMode }
                 val appName = getSystemProperty("sys.nes.info.app_name")
@@ -452,7 +475,7 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 val memoryGb = formatMemoryUsageGB(memoryUsage)
                 val memoryGbPercentage = formatMemoryUsageGBPercentage(memoryUsage)
                 val connectionSpeed = getSystemProperty("sys.nes.info.connection_speed")
-                    .ifEmpty { getConnectionSpeedFallback() }
+                    .ifEmpty { getLiveThroughputSpeed() }
                 val connectionState = getConnectionState()
                 val localTime = getCurrentTimeFormatted(applicationContext)
                 val cpuTemp = if (!isHideCpuTemperature) getHardwarePropertiesCelsius() else ""
@@ -1091,8 +1114,28 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
         }
     }
 
+    private fun getActiveAppFromWindows(): String? {
+        return try {
+            val currentWindows = windows ?: return null
+            for (window in currentWindows) {
+                if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION && (window.isFocused || window.isActive)) {
+                    val rootPkg = window.root?.packageName?.toString()
+                    if (!rootPkg.isNullOrEmpty() && !isSystemComponent(rootPkg)) {
+                        return if (isLauncherPackage(rootPkg)) null else rootPkg
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun getActiveAppNameFallback(): String {
-        val pkg = currentForegroundPackage ?: return ""
+        val pkg = activePlayerPackage
+            ?: getActiveAppFromWindows()
+            ?: currentForegroundPackage
+            ?: return ""
         return try {
             val pm = packageManager
             val appInfo = pm.getApplicationInfo(pkg, 0)
@@ -1149,73 +1192,43 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                     return cachedRealCpuUsage
                 }
             }
-            val freqs = getCpuFrequency()
-            val minFreqs = getMinCpuFrequency()
-            val maxFreqs = getMaxCpuFrequency()
-            if (freqs.isEmpty()) return ""
-            var totalUtil = 0
-            var count = 0
-            for (i in freqs.indices) {
-                val max = if (i < maxFreqs.size) maxFreqs[i] else 0L
-                val min = if (i < minFreqs.size) minFreqs[i] else 0L
-                if (max > min) {
-                    totalUtil += ((freqs[i] - min).toDouble() / (max - min) * 100).toInt()
-                    count++
-                }
-            }
-            if (count > 0) "${totalUtil / count}%" else ""
+            ""
         } catch (e: Exception) {
             ""
         }
     }
 
-    private fun getConnectionSpeedFallback(): String {
-        return try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return ""
-            val network = cm.activeNetwork ?: return ""
-            val capabilities = cm.getNetworkCapabilities(network) ?: return ""
-            val downKbps = capabilities.linkDownstreamBandwidthKbps
-            if (downKbps > 0) {
-                val mbps = downKbps / 1000.0
-                String.format(Locale.US, "%.1f Mbps", mbps)
-            } else ""
-        } catch (e: Exception) {
-            ""
-        }
-    }
+    private var lastTrafficBytes: Long = 0L
+    private var lastTrafficTimestampNanos: Long = 0L
+    private var cachedTrafficSpeed: String = ""
 
-    private fun getHdrStatusFallback(detectedMediaInfo: PortableMediaInfo): String {
-        if (detectedMediaInfo.hdrOutput.isNotEmpty()) return detectedMediaInfo.hdrOutput
-        return try {
-            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
-            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
-            val types = display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf()
-            if (types.isNotEmpty()) {
-                when {
-                    Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION in types -> "Dolby Vision"
-                    Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS in types -> "HDR10+"
-                    Display.HdrCapabilities.HDR_TYPE_HDR10 in types -> "HDR10"
-                    Display.HdrCapabilities.HDR_TYPE_HLG in types -> "HLG"
-                    else -> "SDR"
-                }
-            } else "SDR"
-        } catch (e: Exception) {
-            "Unavailable"
+    private fun getLiveThroughputSpeed(): String {
+        val rx = TrafficStats.getTotalRxBytes()
+        val tx = TrafficStats.getTotalTxBytes()
+        if (rx < 0 || tx < 0) return ""
+        val currentBytes = rx + tx
+        val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+        if (lastTrafficTimestampNanos == 0L) {
+            lastTrafficBytes = currentBytes
+            lastTrafficTimestampNanos = nowNanos
+            return ""
         }
-    }
+        val elapsedSeconds = (nowNanos - lastTrafficTimestampNanos) / 1_000_000_000.0
+        val deltaBytes = currentBytes - lastTrafficBytes
+        lastTrafficBytes = currentBytes
+        lastTrafficTimestampNanos = nowNanos
+        if (elapsedSeconds <= 0.0 || deltaBytes < 0) return cachedTrafficSpeed
 
-    private fun getColorSpaceFallback(): String {
-        return try {
-            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
-            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
-            if (display?.isWideColorGamut == true) {
-                "BT.2020 / DCI-P3"
-            } else {
-                "RGB (8 Bit)"
-            }
-        } catch (e: Exception) {
-            ""
+        val bytesPerSec = deltaBytes / elapsedSeconds
+        val kbPerSec = bytesPerSec / 1024.0
+        val mbPerSec = kbPerSec / 1024.0
+
+        cachedTrafficSpeed = if (mbPerSec >= 1.0) {
+            String.format(Locale.US, "%.1fMB/s", mbPerSec)
+        } else {
+            String.format(Locale.US, "%.0fKB/s", kbPerSec)
         }
+        return cachedTrafficSpeed
     }
 
     private fun getHdrPolicyFallback(): String {
@@ -1225,23 +1238,6 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                 0 -> getString(R.string.follow_sink)
                 1 -> getString(R.string.follow_source)
                 else -> ""
-            }
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
-    private fun getHdrPriorityFallback(): String {
-        return try {
-            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
-            val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
-            val types = display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf()
-            if (Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION in types) {
-                "Dolby Vision"
-            } else if (Display.HdrCapabilities.HDR_TYPE_HDR10 in types) {
-                "HDR10"
-            } else {
-                ""
             }
         } catch (e: Exception) {
             ""
@@ -1270,20 +1266,46 @@ class MainActivity : AccessibilityService(), SharedPreferences.OnSharedPreferenc
                     }
                 }
                 val hdrOutput = HdrOutputParser.parse(rawHdr)
+
+                val attrCommands = listOf(
+                    "cat /sys/class/amhdmitx/amhdmitx0/attr 2>/dev/null",
+                    "cat /sys/devices/virtual/hdmitx/hdmitx0/attr 2>/dev/null",
+                    "cat /sys/class/hdmitx/hdmitx0/attr 2>/dev/null"
+                )
+                var rawAttr = ""
+                for (cmd in attrCommands) {
+                    val out = readAdbCommand(activeConnection, cmd).trim()
+                    if (out.isNotEmpty() && !out.contains("No such file") && !out.contains("denied")) {
+                        rawAttr = out
+                        break
+                    }
+                }
+                val colorSpaceOutput = HdmiColorSettingParser.parse(rawAttr)
+
                 val resources = readAdbCommand(activeConnection, "dumpsys media.resource_manager")
                     .substringBefore("Process Pid override:").substringBefore("Events logs:")
                 val audio = readAdbCommand(activeConnection, "dumpsys media.audio_flinger")
                 val playerPid = resources.split("\n    Pid:")
                     .firstOrNull { "video-codec" in it && ("Name: c2." in it || "Name: OMX." in it) }
                     ?.lineSequence()?.firstOrNull()?.trim()?.toIntOrNull()
+
+                if (playerPid != null) {
+                    val playerCmd = readAdbCommand(activeConnection, "cat /proc/$playerPid/cmdline 2>/dev/null")
+                        .trim().trim('\u0000').substringBefore('\u0000').trim()
+                    if (playerCmd.isNotEmpty() && !isSystemComponent(playerCmd) && !isLauncherPackage(playerCmd)) {
+                        activePlayerPackage = playerCmd
+                    }
+                } else {
+                    activePlayerPackage = null
+                }
+
                 val logs = playerPid?.let { pid ->
                     // Collect only media tags, never account/URL/authorization logs.
                     readAdbCommand(activeConnection, "logcat -d -v threadtime --pid=$pid -t 4000 -s CCodec:D CCodecConfig:D EventLogger:D PlayerEventListener:I")
                 }.orEmpty()
 
                 val parsed = PortableMediaInfoParser.parse(resources, audio, logs)
-                val finalHdr = hdrOutput.ifEmpty { parsed.hdrOutput }
-                parsed.copy(hdrOutput = finalHdr).also {
+                parsed.copy(hdrOutput = hdrOutput, colorSpace = colorSpaceOutput).also {
                     portableMediaInfo = it
                     portableMediaInfoUpdatedAt = System.currentTimeMillis()
                 }
